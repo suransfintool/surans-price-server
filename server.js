@@ -3,43 +3,65 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Allow requests from your Cloudflare app
+// CORS — allow all origins
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
 
-// ── 🥇 GOLD PRICE (IBJA — India's official bullion rate) ─────────
-// Server-side fetch bypasses CORS — same source as Aura Gold/Augmont/SafeGold
-let goldCache = { ibja: 0, fetchedAt: 0 };
+// ── Shared Yahoo Finance fetcher ─────────────────────────────────
+const YA_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' };
 
-app.get('/gold', async (req, res) => {
-  // Cache 10 minutes
-  if (goldCache.ibja > 0 && Date.now() - goldCache.fetchedAt < 10 * 60 * 1000) {
-    return res.json({
-      ibja: goldCache.ibja,
-      aura: +(goldCache.ibja * 1.022).toFixed(2),
-      per10g: +(goldCache.ibja * 10).toFixed(2),
-      source: goldCache.source + ' (cached)',
-      fetchedAt: new Date(goldCache.fetchedAt).toISOString()
-    });
+async function yahooQuote(ticker, range = '2d') {
+  const urls = [
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=${range}`,
+    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=${range}`,
+  ];
+  for (const url of urls) {
+    try {
+      const r = await axios.get(url, { headers: YA_HEADERS, timeout: 10000 });
+      const result = r.data?.chart?.result?.[0];
+      const m = result?.meta;
+      if (!m) continue;
+      const prev = m.previousClose || m.chartPreviousClose || 0;
+      const price = m.regularMarketPrice || prev;
+      const closes = result?.indicators?.quote?.[0]?.close?.filter(Boolean) || [];
+      return {
+        price, prev,
+        change: price - prev,
+        changePct: prev > 0 ? (price - prev) / prev * 100 : 0,
+        high: m.regularMarketDayHigh,
+        low: m.regularMarketDayLow,
+        open: m.regularMarketOpen,
+        volume: m.regularMarketVolume,
+        fiftyTwoWeekHigh: m.fiftyTwoWeekHigh,
+        fiftyTwoWeekLow: m.fiftyTwoWeekLow,
+        name: m.shortName || m.longName || ticker,
+        symbol: ticker,
+        closes: closes.slice(-30),
+      };
+    } catch (e) {}
   }
+  return null;
+}
 
-  const headers = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-IN,en;q=0.9',
-    'Referer': 'https://www.google.com/'
-  };
+// ── CACHE ────────────────────────────────────────────────────────
+let goldCache = { ibja: 0, fetchedAt: 0 };
+let mktCache = { data: null, fetchedAt: 0 };
+const MKT_TTL = 5 * 60 * 1000; // 5 min cache
 
-  // Source 1: ibjarates.com — official IBJA daily rate (per gram shown on page)
+// ── GOLD ─────────────────────────────────────────────────────────
+app.get('/gold', async (req, res) => {
+  if (goldCache.ibja > 0 && Date.now() - goldCache.fetchedAt < 10 * 60 * 1000) {
+    return res.json({ ibja: goldCache.ibja, aura: +(goldCache.ibja * 1.022).toFixed(2), per10g: goldCache.ibja * 10, source: goldCache.source + ' (cached)' });
+  }
+  const headers = { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'text/html', 'Referer': 'https://www.google.com/' };
+  // Source 1: ibjarates.com
   try {
     const r = await axios.get('https://ibjarates.com/', { headers, timeout: 10000 });
-    const html = r.data;
-    // IBJA page shows "14890 (1 Gram)" pattern for 999 purity
-    const m = html.match(/999 Purity[\s\S]{0,200}?(\d{4,6})\s*\(1 Gram\)/i)
-           || html.match(/<h3[^>]*>\s*(\d{4,6})\s*<\/h3>/);
+    const m = r.data.match(/999 Purity[\s\S]{0,200}?(\d{4,6})\s*\(1 Gram\)/i)
+           || r.data.match(/<h3[^>]*>\s*(\d{4,6})\s*<\/h3>/);
     if (m) {
       const rate = parseFloat(m[1]);
       if (rate > 8000 && rate < 30000) {
@@ -47,288 +69,203 @@ app.get('/gold', async (req, res) => {
         return res.json({ ibja: rate, aura: +(rate * 1.022).toFixed(2), per10g: rate * 10, source: 'ibjarates.com' });
       }
     }
-    // Also parse from table — IBJA shows 10g rates in table: "148990" → 14899/g
-    const m2 = html.match(/>\s*(1[34567]\d{4})\s*<\/td>/);
-    if (m2) {
-      const rate10g = parseFloat(m2[1]);
-      if (rate10g > 100000 && rate10g < 300000) {
-        const rate = +(rate10g / 10).toFixed(2);
-        goldCache = { ibja: rate, source: 'ibjarates.com (10g)', fetchedAt: Date.now() };
-        return res.json({ ibja: rate, aura: +(rate * 1.022).toFixed(2), per10g: rate10g, source: 'ibjarates.com (10g)' });
-      }
-    }
-  } catch(e) { console.warn('Gold src1 ibjarates failed:', e.message); }
-
-  // Source 2: Goodreturns — scrapes IBJA, India-specific, very reliable
+  } catch(e) {}
+  // Source 2: Yahoo gold
   try {
-    const r = await axios.get('https://www.goodreturns.in/gold-rates/', { headers, timeout: 10000 });
-    const html = r.data;
-    // "₹14,984 per gram for 24 karat gold"
-    const m = html.match(/[\u20B9₹]([\d,]+)\s*per\s*gram\s*for\s*24/i)
-           || html.match(/24\s*(?:karat|carat|k)[^₹\u20B9]*[\u20B9₹]([\d,]+)\s*per\s*gram/i);
-    if (m) {
-      const rate = parseFloat(m[1].replace(/,/g, ''));
-      if (rate > 8000 && rate < 30000) {
-        goldCache = { ibja: rate, source: 'goodreturns.in', fetchedAt: Date.now() };
-        return res.json({ ibja: rate, aura: +(rate * 1.022).toFixed(2), per10g: rate * 10, source: 'goodreturns.in' });
-      }
+    const g = await yahooQuote('GC=F');
+    if (g?.price) {
+      const usdInr = await yahooQuote('USDINR=X');
+      const rate = g.price * (usdInr?.price || 84) * 0.03215;
+      goldCache = { ibja: Math.round(rate), source: 'Yahoo+FX', fetchedAt: Date.now() };
+      return res.json({ ibja: Math.round(rate), per10g: Math.round(rate) * 10, source: 'Yahoo+FX' });
     }
-  } catch(e) { console.warn('Gold src2 goodreturns failed:', e.message); }
-
-  // Source 3: MCX Gold via NSE/Yahoo Finance (GC=F international × duties)
-  try {
-    const r = await axios.get(
-      'https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1d',
-      { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const usdPerOz = meta?.regularMarketPrice || meta?.previousClose;
-    if (usdPerOz > 0) {
-      // Get USD/INR rate
-      let usdInr = 84;
-      try {
-        const fx = await axios.get('https://open.er-api.com/v6/latest/USD', { timeout: 5000 });
-        usdInr = fx.data?.rates?.INR || 84;
-      } catch(e) {}
-      // India gold = international + 6% import duty + 3% GST + ~5% bank/dealer margin = 14%
-      const rate = +((usdPerOz / 31.1035) * usdInr * 1.14).toFixed(2);
-      if (rate > 8000 && rate < 30000) {
-        goldCache = { ibja: rate, source: 'MCX-equivalent (Yahoo+duty)', fetchedAt: Date.now() };
-        return res.json({ ibja: rate, aura: +(rate * 1.022).toFixed(2), per10g: rate * 10, source: 'MCX-equivalent' });
-      }
-    }
-  } catch(e) { console.warn('Gold src3 yahoo failed:', e.message); }
-
-  // Source 4: goldpricez free API (no key needed for basic access)
-  try {
-    const r = await axios.get('https://data-asg.goldprice.org/dbXRates/INR',
-      { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 });
-    const inrPerOz = r.data?.items?.[0]?.xauPrice;
-    if (inrPerOz > 100000) {
-      const rate = +((inrPerOz / 31.1035)).toFixed(2);
-      if (rate > 8000 && rate < 30000) {
-        goldCache = { ibja: rate, source: 'goldprice.org', fetchedAt: Date.now() };
-        return res.json({ ibja: rate, aura: +(rate * 1.022).toFixed(2), per10g: rate * 10, source: 'goldprice.org' });
-      }
-    }
-  } catch(e) { console.warn('Gold src4 failed:', e.message); }
-
-  res.status(503).json({ error: 'Could not fetch gold price', ibja: null });
+  } catch(e) {}
+  res.status(500).json({ error: 'Gold price unavailable' });
 });
 
-// ── Indian stocks (NSE) ──────────────────────────────────────────
+// ── NSE single stock ─────────────────────────────────────────────
 app.get('/nse/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
-  try {
-    // Try NSE India direct API
-    const r = await axios.get(
-      `https://www.nseindia.com/api/quote-equity?symbol=${symbol}`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://www.nseindia.com',
-          'Cookie': ''
-        },
-        timeout: 8000
-      }
-    );
-    const price = r.data?.priceInfo?.lastPrice
-               || r.data?.priceInfo?.close
-               || r.data?.lastPrice;
-    if (price) return res.json({ symbol, price, source: 'NSE' });
-  } catch(e) {}
-
-  // Fallback: Yahoo Finance (server-side, no CORS issue)
-  try {
-    const r = await axios.get(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1d`,
-      {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 8000
-      }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice || meta?.previousClose;
-    if (price) return res.json({ symbol, price, source: 'Yahoo' });
-  } catch(e) {}
-
-  // Fallback 2: Yahoo query2
-  try {
-    const r = await axios.get(
-      `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1d`,
-      {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 8000
-      }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice || meta?.previousClose;
-    if (price) return res.json({ symbol, price, source: 'Yahoo2' });
-  } catch(e) {}
-
-  res.status(404).json({ symbol, price: null, error: 'Price not found' });
+  // Try Yahoo Finance with .NS suffix
+  const d = await yahooQuote(symbol + '.NS');
+  if (d?.price) return res.json({ symbol, price: d.price, source: 'Yahoo' });
+  // Try without suffix (indices like ^NSEI)
+  const d2 = await yahooQuote(symbol);
+  if (d2?.price) return res.json({ symbol, price: d2.price, source: 'Yahoo' });
+  res.status(404).json({ symbol, price: null, error: 'Not found' });
 });
 
 // ── US stocks ────────────────────────────────────────────────────
 app.get('/us/:symbol', async (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
-  try {
-    const r = await axios.get(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`,
-      {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 8000
-      }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice || meta?.previousClose;
-    if (price) return res.json({ symbol, price, source: 'Yahoo' });
-  } catch(e) {}
-
-  res.status(404).json({ symbol, price: null, error: 'Price not found' });
+  const d = await yahooQuote(symbol);
+  if (d?.price) return res.json({ symbol, price: d.price, source: 'Yahoo' });
+  res.status(404).json({ symbol, price: null, error: 'Not found' });
 });
 
-// ── Batch endpoint (multiple symbols at once) ────────────────────
+// ── Batch ─────────────────────────────────────────────────────────
 app.get('/batch', async (req, res) => {
   const { symbols, type } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
-
   const list = symbols.split(',').map(s => s.trim().toUpperCase());
   const results = {};
-
   await Promise.all(list.map(async sym => {
-    try {
-      const ticker = type === 'IN' ? `${sym}.NS` : sym;
-      const r = await axios.get(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`,
-        { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 }
-      );
-      const meta = r.data?.chart?.result?.[0]?.meta;
-      const price = meta?.regularMarketPrice || meta?.previousClose;
-      if (price) results[sym] = price;
-    } catch(e) {}
+    const ticker = type === 'IN' ? sym + '.NS' : sym;
+    const d = await yahooQuote(ticker);
+    if (d?.price) results[sym] = d.price;
   }));
-
   res.json(results);
+});
+
+// ══════════════════════════════════════════════════════════════════
+// ── MARKET DATA — Full Stonkzz-style endpoint ─────────────────────
+// All fetched server-side to bypass CORS
+// ══════════════════════════════════════════════════════════════════
+app.get('/marketdata', async (req, res) => {
+  // Use cache if fresh
+  if (mktCache.data && Date.now() - mktCache.fetchedAt < MKT_TTL) {
+    return res.json({ ...mktCache.data, cached: true, cacheAge: Math.round((Date.now() - mktCache.fetchedAt) / 1000) });
+  }
+
+  // Fetch all in parallel
+  const [
+    nifty50, bankNifty, midcap, smallcap, sensex,
+    niftyIT, niftyPharma, niftyFMCG, niftyAuto, niftyMetal, niftyRealty, niftyEnergy,
+    indiaVIX, giftNifty,
+    sp500, nasdaq, dow, ftse, hangseng, nikkei, dax,
+    crude, gold, silver, naturalGas,
+    usdinr, eurinr, jpyinr, gbpinr
+  ] = await Promise.all([
+    yahooQuote('^NSEI'), yahooQuote('^NSEBANK'), yahooQuote('^CNXMIDCAP'), yahooQuote('^CNXSMALL'), yahooQuote('^BSESN'),
+    yahooQuote('^CNXIT'), yahooQuote('^CNXPHARMA'), yahooQuote('^CNXFMCG'), yahooQuote('^CNXAUTO'), yahooQuote('^CNXMETAL'),
+    yahooQuote('^CNXREALTY'), yahooQuote('^CNXENERGY'),
+    yahooQuote('^INDIAVIX'), yahooQuote('NF=F'),
+    yahooQuote('^GSPC'), yahooQuote('^IXIC'), yahooQuote('^DJI'), yahooQuote('^FTSE'),
+    yahooQuote('^HSI'), yahooQuote('^N225'), yahooQuote('^GDAXI'),
+    yahooQuote('CL=F'), yahooQuote('GC=F'), yahooQuote('SI=F'), yahooQuote('NG=F'),
+    yahooQuote('USDINR=X'), yahooQuote('EURINR=X'), yahooQuote('JPYINR=X'), yahooQuote('GBPINR=X')
+  ]);
+
+  // NIFTY 30-day history
+  const niftyHistory = await yahooQuote('^NSEI', '1mo');
+
+  // USD/INR from fawazahmed (most accurate free source)
+  let usdInrRate = usdinr?.price || 84;
+  try {
+    const fx = await axios.get('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', { timeout: 5000 });
+    if (fx.data?.usd?.inr) usdInrRate = fx.data.usd.inr;
+  } catch(e) {}
+
+  // Gold INR price
+  let goldInr = null;
+  if (goldCache.ibja > 0) {
+    goldInr = goldCache.ibja;
+  } else if (gold?.price) {
+    goldInr = Math.round(gold.price * usdInrRate * 0.03215);
+  }
+
+  // FII/DII — NSE public API (server-side bypasses CORS)
+  let fiiNet=null, fiiB=null, fiiS=null, diiNet=null, diiB=null, diiS=null, fiiHistory=[];
+  try {
+    // First get NSE cookie
+    const cookieR = await axios.get('https://www.nseindia.com', {
+      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'text/html' },
+      timeout: 8000
+    });
+    const cookie = cookieR.headers['set-cookie']?.map(c => c.split(';')[0]).join('; ') || '';
+    const fiiR = await axios.get('https://www.nseindia.com/api/fiidiiTradeReact', {
+      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'application/json', 'Referer': 'https://www.nseindia.com', 'Cookie': cookie },
+      timeout: 8000
+    });
+    if (fiiR.data?.length) {
+      const t = fiiR.data[0];
+      fiiNet = parseFloat(t.NET_VALUE_FII) || 0;
+      fiiB   = parseFloat(t.BUY_VALUE_FII) || 0;
+      fiiS   = parseFloat(t.SELL_VALUE_FII) || 0;
+      diiNet = parseFloat(t.NET_VALUE_DII) || 0;
+      diiB   = parseFloat(t.BUY_VALUE_DII) || 0;
+      diiS   = parseFloat(t.SELL_VALUE_DII) || 0;
+      fiiHistory = fiiR.data.slice(0, 7).map(row => ({
+        date: row.date || row.DATE || '',
+        fii: parseFloat(row.NET_VALUE_FII) || 0,
+        dii: parseFloat(row.NET_VALUE_DII) || 0
+      }));
+    }
+  } catch(e) { console.log('FII fetch failed:', e.message); }
+
+  // NIFTY 50 stock list (for heatmap + gainers/losers + A/D)
+  let nifty50Stocks=[], adv=0, dec=0, unc=0, topGainers=[], topLosers=[];
+  try {
+    const cookieR2 = await axios.get('https://www.nseindia.com', {
+      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'text/html' }, timeout: 8000
+    });
+    const cookie2 = cookieR2.headers['set-cookie']?.map(c => c.split(';')[0]).join('; ') || '';
+    const nseR = await axios.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050', {
+      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'application/json', 'Referer': 'https://www.nseindia.com', 'Cookie': cookie2 },
+      timeout: 10000
+    });
+    const stocks = (nseR.data?.data || []).filter(s => s.symbol !== 'NIFTY 50');
+    nifty50Stocks = stocks.map(s => ({
+      symbol: s.symbol, price: s.lastPrice, chgPct: s.pChange,
+      chg: s.change, high: s.dayHigh, low: s.dayLow,
+      open: s.open, prev: s.previousClose, volume: s.totalTradedVolume,
+      mcap: s.totalMarketCap || s.ffmc || 0
+    }));
+    stocks.forEach(s => { if (s.pChange > 0) adv++; else if (s.pChange < 0) dec++; else unc++; });
+    topGainers = [...nifty50Stocks].sort((a,b) => b.chgPct - a.chgPct).slice(0, 5);
+    topLosers  = [...nifty50Stocks].sort((a,b) => a.chgPct - b.chgPct).slice(0, 5);
+  } catch(e) { console.log('NSE stocks failed:', e.message); }
+
+  // Market Mood Index calculation
+  let mmi = 50;
+  if (nifty50?.price && nifty50.fiftyTwoWeekLow && nifty50.fiftyTwoWeekHigh) {
+    const range = nifty50.fiftyTwoWeekHigh - nifty50.fiftyTwoWeekLow;
+    if (range > 0) mmi = ((nifty50.price - nifty50.fiftyTwoWeekLow) / range) * 100;
+  }
+  const vixVal = indiaVIX?.price || 0;
+  if (vixVal > 0) { const vs = vixVal<12?85:vixVal<16?70:vixVal<20?50:vixVal<25?30:15; mmi = (mmi + vs) / 2; }
+  if (fiiNet !== null) { const fs = fiiNet>2000?80:fiiNet>0?62:fiiNet>-2000?40:20; mmi = (mmi * 2 + fs) / 3; }
+  if (adv + dec > 0) { const as = (adv / (adv + dec)) * 100; mmi = (mmi * 3 + as) / 4; }
+  mmi = Math.max(0, Math.min(100, Math.round(mmi)));
+  const mmiLabel = mmi>=70?'Extreme Greed':mmi>=55?'Greed':mmi>=45?'Neutral':mmi>=30?'Fear':'Extreme Fear';
+  const mmiColor = mmi>=70?'#00c853':mmi>=55?'#76d275':mmi>=45?'#ffba00':mmi>=30?'#ff6f00':'#f44336';
+
+  const data = {
+    ts: Date.now(),
+    // Indian indices
+    nifty50, bankNifty, midcap, smallcap, sensex,
+    // Sectoral
+    niftyIT, niftyPharma, niftyFMCG, niftyAuto, niftyMetal, niftyRealty, niftyEnergy,
+    // VIX + GIFT
+    indiaVIX, giftNifty,
+    // Global
+    sp500, nasdaq, dow, ftse, hangseng, nikkei, dax,
+    // Commodities
+    crude, gold, silver, naturalGas,
+    // Currency
+    usdinr, eurinr, jpyinr, gbpinr, usdInrRate,
+    // FII/DII
+    fiiNet, fiiB, fiiS, diiNet, diiB, diiS, fiiHistory,
+    // Breadth + Heatmap
+    adv, dec, unc, nifty50Stocks, topGainers, topLosers,
+    // Mood
+    mmi, mmiLabel, mmiColor,
+    // History
+    niftyCloses: niftyHistory?.closes || []
+  };
+
+  mktCache = { data, fetchedAt: Date.now() };
+  res.json(data);
 });
 
 // ── Health check ─────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'Surans Fin Tool Price Server v2.0 running!',
-    endpoints: ['/gold', '/nse/:symbol', '/us/:symbol', '/batch?symbols=X,Y&type=IN'],
-    goldCache: goldCache.ibja > 0 ? `₹${goldCache.ibja}/g (${goldCache.source})` : 'not fetched yet'
+    status: 'Surans Price Server v3.0',
+    endpoints: ['/gold', '/nse/:symbol', '/us/:symbol', '/batch', '/marketdata'],
+    marketDataCached: mktCache.data ? `Yes (${Math.round((Date.now()-mktCache.fetchedAt)/1000)}s ago)` : 'No',
+    goldCache: goldCache.ibja > 0 ? `₹${goldCache.ibja}/g` : 'Not fetched'
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Price server running on port ${PORT}`);
-});
-
-app.get('/nse/:symbol', async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase();
-  try {
-    // Try NSE India direct API
-    const r = await axios.get(
-      `https://www.nseindia.com/api/quote-equity?symbol=${symbol}`,
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept': 'application/json',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Referer': 'https://www.nseindia.com',
-          'Cookie': ''
-        },
-        timeout: 8000
-      }
-    );
-    const price = r.data?.priceInfo?.lastPrice
-               || r.data?.priceInfo?.close
-               || r.data?.lastPrice;
-    if (price) return res.json({ symbol, price, source: 'NSE' });
-  } catch(e) {}
-
-  // Fallback: Yahoo Finance (server-side, no CORS issue)
-  try {
-    const r = await axios.get(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1d`,
-      {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 8000
-      }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice || meta?.previousClose;
-    if (price) return res.json({ symbol, price, source: 'Yahoo' });
-  } catch(e) {}
-
-  // Fallback 2: Yahoo query2
-  try {
-    const r = await axios.get(
-      `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}.NS?interval=1d&range=1d`,
-      {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 8000
-      }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice || meta?.previousClose;
-    if (price) return res.json({ symbol, price, source: 'Yahoo2' });
-  } catch(e) {}
-
-  res.status(404).json({ symbol, price: null, error: 'Price not found' });
-});
-
-// ── US stocks ────────────────────────────────────────────────────
-app.get('/us/:symbol', async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase();
-  try {
-    const r = await axios.get(
-      `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1d`,
-      {
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-        timeout: 8000
-      }
-    );
-    const meta = r.data?.chart?.result?.[0]?.meta;
-    const price = meta?.regularMarketPrice || meta?.previousClose;
-    if (price) return res.json({ symbol, price, source: 'Yahoo' });
-  } catch(e) {}
-
-  res.status(404).json({ symbol, price: null, error: 'Price not found' });
-});
-
-// ── Batch endpoint (multiple symbols at once) ────────────────────
-app.get('/batch', async (req, res) => {
-  const { symbols, type } = req.query;
-  if (!symbols) return res.status(400).json({ error: 'symbols required' });
-
-  const list = symbols.split(',').map(s => s.trim().toUpperCase());
-  const results = {};
-
-  await Promise.all(list.map(async sym => {
-    try {
-      const ticker = type === 'IN' ? `${sym}.NS` : sym;
-      const r = await axios.get(
-        `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1d`,
-        { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 8000 }
-      );
-      const meta = r.data?.chart?.result?.[0]?.meta;
-      const price = meta?.regularMarketPrice || meta?.previousClose;
-      if (price) results[sym] = price;
-    } catch(e) {}
-  }));
-
-  res.json(results);
-});
-
-// ── Health check ─────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'Surans Fin Tool Price Server running!' });
-});
-
-app.listen(PORT, () => {
-  console.log(`Price server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Price server v3.0 running on port ${PORT}`));
