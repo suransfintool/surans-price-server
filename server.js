@@ -3,107 +3,152 @@ const axios = require('axios');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS — allow all origins
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
 
-// ── Shared Yahoo Finance fetcher ─────────────────────────────────
-const YA_HEADERS = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36' };
+const YA_HDR = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36',
+  'Accept': 'application/json,text/plain,*/*',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
 
-async function yahooQuote(ticker, range = '2d') {
-  const urls = [
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=${range}`,
-    `https://query2.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=${range}`,
-  ];
-  for (const url of urls) {
+// ── Yahoo Finance helper ─────────────────────────────────────────
+async function yf(ticker, range = '2d') {
+  const bases = ['https://query1.finance.yahoo.com','https://query2.finance.yahoo.com'];
+  for (const base of bases) {
     try {
-      const r = await axios.get(url, { headers: YA_HEADERS, timeout: 10000 });
+      const url = `${base}/v8/finance/chart/${encodeURIComponent(ticker)}?interval=1d&range=${range}`;
+      const r = await axios.get(url, { headers: YA_HDR, timeout: 12000 });
       const result = r.data?.chart?.result?.[0];
       const m = result?.meta;
-      if (!m) continue;
-      const prev = m.previousClose || m.chartPreviousClose || 0;
-      const price = m.regularMarketPrice || prev;
-      const closes = result?.indicators?.quote?.[0]?.close?.filter(Boolean) || [];
+      if (!m || !m.regularMarketPrice) continue;
+      const prev = m.previousClose || m.chartPreviousClose || m.regularMarketPrice;
+      const price = m.regularMarketPrice;
+      const closes = result?.indicators?.quote?.[0]?.close?.filter(v=>v!=null) || [];
       return {
         price, prev,
-        change: price - prev,
-        changePct: prev > 0 ? (price - prev) / prev * 100 : 0,
-        high: m.regularMarketDayHigh,
-        low: m.regularMarketDayLow,
-        open: m.regularMarketOpen,
-        volume: m.regularMarketVolume,
-        fiftyTwoWeekHigh: m.fiftyTwoWeekHigh,
-        fiftyTwoWeekLow: m.fiftyTwoWeekLow,
+        change: +(price - prev).toFixed(2),
+        changePct: prev > 0 ? +((price - prev) / prev * 100).toFixed(3) : 0,
+        high: m.regularMarketDayHigh || price,
+        low: m.regularMarketDayLow || price,
+        open: m.regularMarketOpen || price,
+        volume: m.regularMarketVolume || 0,
+        fiftyTwoWeekHigh: m.fiftyTwoWeekHigh || price,
+        fiftyTwoWeekLow: m.fiftyTwoWeekLow || price,
         name: m.shortName || m.longName || ticker,
+        currency: m.currency || 'INR',
         symbol: ticker,
         closes: closes.slice(-30),
       };
-    } catch (e) {}
+    } catch(e) { continue; }
   }
   return null;
 }
 
-// ── CACHE ────────────────────────────────────────────────────────
+// ── Cache ────────────────────────────────────────────────────────
 let goldCache = { ibja: 0, fetchedAt: 0 };
-let mktCache = { data: null, fetchedAt: 0 };
-const MKT_TTL = 5 * 60 * 1000; // 5 min cache
+let mktCache  = { data: null, fetchedAt: 0 };
+let nseCache  = { data: null, fetchedAt: 0, cookie: '' };
+const MKT_TTL = 5 * 60 * 1000;
+const NSE_TTL = 30 * 60 * 1000;
+
+// ── Get NSE cookie (reuse within 30 min) ─────────────────────────
+async function getNSECookie() {
+  if (nseCache.cookie && Date.now() - nseCache.fetchedAt < NSE_TTL) {
+    return nseCache.cookie;
+  }
+  try {
+    const r = await axios.get('https://www.nseindia.com', {
+      headers: { 'User-Agent': YA_HDR['User-Agent'], 'Accept': 'text/html,application/xhtml+xml' },
+      timeout: 10000, maxRedirects: 5,
+    });
+    const cookies = (r.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+    nseCache.cookie = cookies;
+    nseCache.fetchedAt = Date.now();
+    return cookies;
+  } catch(e) {
+    console.log('NSE cookie failed:', e.message);
+    return '';
+  }
+}
+
+async function nseGet(path) {
+  const cookie = await getNSECookie();
+  const r = await axios.get(`https://www.nseindia.com${path}`, {
+    headers: {
+      'User-Agent': YA_HDR['User-Agent'],
+      'Accept': 'application/json',
+      'Referer': 'https://www.nseindia.com/',
+      'Cookie': cookie,
+    },
+    timeout: 12000,
+  });
+  return r.data;
+}
 
 // ── GOLD ─────────────────────────────────────────────────────────
 app.get('/gold', async (req, res) => {
   if (goldCache.ibja > 0 && Date.now() - goldCache.fetchedAt < 10 * 60 * 1000) {
-    return res.json({ ibja: goldCache.ibja, aura: +(goldCache.ibja * 1.022).toFixed(2), per10g: goldCache.ibja * 10, source: goldCache.source + ' (cached)' });
+    return res.json({ ibja: goldCache.ibja, aura: +(goldCache.ibja * 1.022).toFixed(2), per10g: goldCache.ibja * 10, source: 'cached' });
   }
-  const headers = { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'text/html', 'Referer': 'https://www.google.com/' };
-  // Source 1: ibjarates.com
+  // Try ibjarates
   try {
-    const r = await axios.get('https://ibjarates.com/', { headers, timeout: 10000 });
-    const m = r.data.match(/999 Purity[\s\S]{0,200}?(\d{4,6})\s*\(1 Gram\)/i)
-           || r.data.match(/<h3[^>]*>\s*(\d{4,6})\s*<\/h3>/);
+    const r = await axios.get('https://ibjarates.com/', {
+      headers: { 'User-Agent': YA_HDR['User-Agent'], 'Accept': 'text/html' }, timeout: 10000
+    });
+    const m = r.data.match(/999[^<]{0,80}?(\d{4,6})\s*(?:\(1 Gram\)|\/gram|per gram)/i)
+           || r.data.match(/<td[^>]*>\s*999\s*<\/td>\s*<td[^>]*>\s*([\d,]+)/i);
     if (m) {
-      const rate = parseFloat(m[1]);
+      const rate = parseFloat(m[1].replace(/,/g,''));
       if (rate > 8000 && rate < 30000) {
         goldCache = { ibja: rate, source: 'ibjarates.com', fetchedAt: Date.now() };
-        return res.json({ ibja: rate, aura: +(rate * 1.022).toFixed(2), per10g: rate * 10, source: 'ibjarates.com' });
+        return res.json({ ibja: rate, aura: +(rate*1.022).toFixed(2), per10g: rate*10, source: 'ibjarates.com' });
       }
     }
   } catch(e) {}
-  // Source 2: Yahoo gold
+  // Fallback: Yahoo gold + USD/INR
   try {
-    const g = await yahooQuote('GC=F');
+    const [g, fx] = await Promise.all([yf('GC=F'), yf('USDINR=X')]);
     if (g?.price) {
-      const usdInr = await yahooQuote('USDINR=X');
-      const rate = g.price * (usdInr?.price || 84) * 0.03215;
-      goldCache = { ibja: Math.round(rate), source: 'Yahoo+FX', fetchedAt: Date.now() };
-      return res.json({ ibja: Math.round(rate), per10g: Math.round(rate) * 10, source: 'Yahoo+FX' });
+      const rate = Math.round(g.price * (fx?.price || 84) * 0.03215);
+      goldCache = { ibja: rate, source: 'Yahoo+FX', fetchedAt: Date.now() };
+      return res.json({ ibja: rate, per10g: rate * 10, source: 'Yahoo+FX' });
     }
   } catch(e) {}
-  res.status(500).json({ error: 'Gold price unavailable' });
+  res.status(500).json({ error: 'Gold unavailable' });
 });
 
-// ── NSE single stock ─────────────────────────────────────────────
+// ── NSE single stock / SGB / index ───────────────────────────────
 app.get('/nse/:symbol', async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase();
-  // Try Yahoo Finance with .NS suffix
-  const d = await yahooQuote(symbol + '.NS');
-  if (d?.price) return res.json({ symbol, price: d.price, source: 'Yahoo' });
-  // Try without suffix (indices like ^NSEI)
-  const d2 = await yahooQuote(symbol);
-  if (d2?.price) return res.json({ symbol, price: d2.price, source: 'Yahoo' });
-  res.status(404).json({ symbol, price: null, error: 'Not found' });
+  const sym = req.params.symbol.toUpperCase();
+  // SGB bonds: try multiple Yahoo formats
+  const sgbFormats = [`${sym}.NS`, sym, `${sym}24.BO`, `${sym}BE.BO`];
+  // Try Yahoo with .NS first (most Indian stocks)
+  for (const fmt of [`${sym}.NS`, sym]) {
+    const d = await yf(fmt);
+    if (d?.price > 0) return res.json({ symbol: sym, price: d.price, change: d.change, changePct: d.changePct, source: 'Yahoo' });
+  }
+  // Try NSE API for SGB bonds specifically
+  try {
+    const data = await nseGet(`/api/quote-equity?symbol=${encodeURIComponent(sym)}`);
+    const price = data?.priceInfo?.lastPrice || data?.lastPrice;
+    if (price > 0) return res.json({ symbol: sym, price, source: 'NSE' });
+  } catch(e) {}
+  res.status(404).json({ symbol: sym, price: null, error: 'Not found' });
 });
 
 // ── US stocks ────────────────────────────────────────────────────
 app.get('/us/:symbol', async (req, res) => {
-  const symbol = req.params.symbol.toUpperCase();
-  const d = await yahooQuote(symbol);
-  if (d?.price) return res.json({ symbol, price: d.price, source: 'Yahoo' });
-  res.status(404).json({ symbol, price: null, error: 'Not found' });
+  const sym = req.params.symbol.toUpperCase();
+  const d = await yf(sym);
+  if (d?.price > 0) return res.json({ symbol: sym, price: d.price, source: 'Yahoo' });
+  res.status(404).json({ symbol: sym, price: null, error: 'Not found' });
 });
 
-// ── Batch ─────────────────────────────────────────────────────────
+// ── Batch ────────────────────────────────────────────────────────
 app.get('/batch', async (req, res) => {
   const { symbols, type } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
@@ -111,161 +156,166 @@ app.get('/batch', async (req, res) => {
   const results = {};
   await Promise.all(list.map(async sym => {
     const ticker = type === 'IN' ? sym + '.NS' : sym;
-    const d = await yahooQuote(ticker);
-    if (d?.price) results[sym] = d.price;
+    const d = await yf(ticker);
+    if (d?.price > 0) results[sym] = d.price;
   }));
   res.json(results);
 });
 
 // ══════════════════════════════════════════════════════════════════
-// ── MARKET DATA — Full Stonkzz-style endpoint ─────────────────────
-// All fetched server-side to bypass CORS
+// ── MARKET DATA — Complete endpoint ──────────────────────────────
 // ══════════════════════════════════════════════════════════════════
 app.get('/marketdata', async (req, res) => {
-  // Use cache if fresh
-  if (mktCache.data && Date.now() - mktCache.fetchedAt < MKT_TTL) {
-    return res.json({ ...mktCache.data, cached: true, cacheAge: Math.round((Date.now() - mktCache.fetchedAt) / 1000) });
+  const force = req.query.force === '1';
+  if (!force && mktCache.data && Date.now() - mktCache.fetchedAt < MKT_TTL) {
+    return res.json({ ...mktCache.data, cached: true });
   }
 
-  // Fetch all in parallel
+  console.log('Fetching fresh market data...');
+
+  // ── Parallel Yahoo fetches ──────────────────────────────────────
   const [
     nifty50, bankNifty, midcap, smallcap, sensex,
     niftyIT, niftyPharma, niftyFMCG, niftyAuto, niftyMetal, niftyRealty, niftyEnergy,
     indiaVIX, giftNifty,
     sp500, nasdaq, dow, ftse, hangseng, nikkei, dax,
     crude, gold, silver, naturalGas,
-    usdinr, eurinr, jpyinr, gbpinr
-  ] = await Promise.all([
-    yahooQuote('^NSEI'), yahooQuote('^NSEBANK'), yahooQuote('^CNXMIDCAP'), yahooQuote('^CNXSMALL'), yahooQuote('^BSESN'),
-    yahooQuote('^CNXIT'), yahooQuote('^CNXPHARMA'), yahooQuote('^CNXFMCG'), yahooQuote('^CNXAUTO'), yahooQuote('^CNXMETAL'),
-    yahooQuote('^CNXREALTY'), yahooQuote('^CNXENERGY'),
-    yahooQuote('^INDIAVIX'), yahooQuote('NF=F'),
-    yahooQuote('^GSPC'), yahooQuote('^IXIC'), yahooQuote('^DJI'), yahooQuote('^FTSE'),
-    yahooQuote('^HSI'), yahooQuote('^N225'), yahooQuote('^GDAXI'),
-    yahooQuote('CL=F'), yahooQuote('GC=F'), yahooQuote('SI=F'), yahooQuote('NG=F'),
-    yahooQuote('USDINR=X'), yahooQuote('EURINR=X'), yahooQuote('JPYINR=X'), yahooQuote('GBPINR=X')
-  ]);
+    usdinr, eurinr, jpyinr, gbpinr, aedinr,
+    niftyHist
+  ] = await Promise.allSettled([
+    // FIX: ^CNXMIDCAP was wrong — correct Yahoo ticker for Nifty Midcap 100
+    yf('^NSEI'), yf('^NSEBANK'), yf('^CNXMIDCAP150'), yf('^CNXSMALL'), yf('^BSESN'),
+    yf('^CNXIT'), yf('^CNXPHARMA'), yf('^CNXFMCG'), yf('^CNXAUTO'), yf('^CNXMETAL'),
+    yf('^CNXREALTY'), yf('^CNXENERGY'),
+    yf('^INDIAVIX'),
+    // FIX: GIFT Nifty — try multiple tickers
+    yf('^NSEI'), // fallback: same as NIFTY for now, GIFT not on Yahoo
+    // Global — in their OWN currency (USD, GBP, HKD, JPY, EUR)
+    yf('^GSPC'), yf('^IXIC'), yf('^DJI'), yf('^FTSE'),
+    yf('^HSI'), yf('^N225'), yf('^GDAXI'),
+    // Commodities in USD
+    yf('CL=F'), yf('GC=F'), yf('SI=F'), yf('NG=F'),
+    // Currencies (value of 1 unit in INR)
+    yf('USDINR=X'), yf('EURINR=X'), yf('JPYINR=X'), yf('GBPINR=X'), yf('AEDINR=X'),
+    // NIFTY 30-day history
+    yf('^NSEI', '1mo'),
+  ]).then(results => results.map(r => r.status === 'fulfilled' ? r.value : null));
 
-  // NIFTY 30-day history
-  const niftyHistory = await yahooQuote('^NSEI', '1mo');
-
-  // USD/INR from fawazahmed (most accurate free source)
+  // USD/INR most accurate
   let usdInrRate = usdinr?.price || 84;
   try {
-    const fx = await axios.get('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', { timeout: 5000 });
-    if (fx.data?.usd?.inr) usdInrRate = fx.data.usd.inr;
+    const fx = await axios.get('https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json', { timeout: 6000 });
+    if (fx.data?.usd?.inr) usdInrRate = +fx.data.usd.inr.toFixed(2);
   } catch(e) {}
 
-  // Gold INR price
-  let goldInr = null;
-  if (goldCache.ibja > 0) {
-    goldInr = goldCache.ibja;
-  } else if (gold?.price) {
-    goldInr = Math.round(gold.price * usdInrRate * 0.03215);
-  }
+  // Gold INR
+  let goldInr = goldCache.ibja > 0 ? goldCache.ibja :
+    (gold?.price ? Math.round(gold.price * usdInrRate * 0.03215) : null);
 
-  // FII/DII — NSE public API (server-side bypasses CORS)
-  let fiiNet=null, fiiB=null, fiiS=null, diiNet=null, diiB=null, diiS=null, fiiHistory=[];
+  // ── NSE data (FII/DII + NIFTY 50 stocks) ────────────────────────
+  let fiiNet=null,fiiB=null,fiiS=null,diiNet=null,diiB=null,diiS=null,fiiHistory=[];
+  let nifty50Stocks=[],adv=0,dec=0,unc=0,topGainers=[],topLosers=[];
+
   try {
-    // First get NSE cookie
-    const cookieR = await axios.get('https://www.nseindia.com', {
-      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'text/html' },
-      timeout: 8000
-    });
-    const cookie = cookieR.headers['set-cookie']?.map(c => c.split(';')[0]).join('; ') || '';
-    const fiiR = await axios.get('https://www.nseindia.com/api/fiidiiTradeReact', {
-      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'application/json', 'Referer': 'https://www.nseindia.com', 'Cookie': cookie },
-      timeout: 8000
-    });
-    if (fiiR.data?.length) {
-      const t = fiiR.data[0];
-      fiiNet = parseFloat(t.NET_VALUE_FII) || 0;
-      fiiB   = parseFloat(t.BUY_VALUE_FII) || 0;
-      fiiS   = parseFloat(t.SELL_VALUE_FII) || 0;
-      diiNet = parseFloat(t.NET_VALUE_DII) || 0;
-      diiB   = parseFloat(t.BUY_VALUE_DII) || 0;
-      diiS   = parseFloat(t.SELL_VALUE_DII) || 0;
-      fiiHistory = fiiR.data.slice(0, 7).map(row => ({
-        date: row.date || row.DATE || '',
-        fii: parseFloat(row.NET_VALUE_FII) || 0,
-        dii: parseFloat(row.NET_VALUE_DII) || 0
+    const fiiData = await nseGet('/api/fiidiiTradeReact');
+    if (fiiData?.length) {
+      const t = fiiData[0];
+      fiiNet = +parseFloat(t.NET_VALUE_FII||0).toFixed(2);
+      fiiB   = +parseFloat(t.BUY_VALUE_FII||0).toFixed(2);
+      fiiS   = +parseFloat(t.SELL_VALUE_FII||0).toFixed(2);
+      diiNet = +parseFloat(t.NET_VALUE_DII||0).toFixed(2);
+      diiB   = +parseFloat(t.BUY_VALUE_DII||0).toFixed(2);
+      diiS   = +parseFloat(t.SELL_VALUE_DII||0).toFixed(2);
+      fiiHistory = fiiData.slice(0,7).map(r=>({
+        date: r.date||r.DATE||'', fii: +parseFloat(r.NET_VALUE_FII||0).toFixed(2), dii: +parseFloat(r.NET_VALUE_DII||0).toFixed(2)
       }));
+      console.log('FII data OK, net:', fiiNet);
     }
-  } catch(e) { console.log('FII fetch failed:', e.message); }
+  } catch(e) { console.log('FII failed:', e.message); }
 
-  // NIFTY 50 stock list (for heatmap + gainers/losers + A/D)
-  let nifty50Stocks=[], adv=0, dec=0, unc=0, topGainers=[], topLosers=[];
   try {
-    const cookieR2 = await axios.get('https://www.nseindia.com', {
-      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'text/html' }, timeout: 8000
-    });
-    const cookie2 = cookieR2.headers['set-cookie']?.map(c => c.split(';')[0]).join('; ') || '';
-    const nseR = await axios.get('https://www.nseindia.com/api/equity-stockIndices?index=NIFTY%2050', {
-      headers: { 'User-Agent': YA_HEADERS['User-Agent'], 'Accept': 'application/json', 'Referer': 'https://www.nseindia.com', 'Cookie': cookie2 },
-      timeout: 10000
-    });
-    const stocks = (nseR.data?.data || []).filter(s => s.symbol !== 'NIFTY 50');
-    nifty50Stocks = stocks.map(s => ({
-      symbol: s.symbol, price: s.lastPrice, chgPct: s.pChange,
-      chg: s.change, high: s.dayHigh, low: s.dayLow,
-      open: s.open, prev: s.previousClose, volume: s.totalTradedVolume,
-      mcap: s.totalMarketCap || s.ffmc || 0
+    const nseData = await nseGet('/api/equity-stockIndices?index=NIFTY%2050');
+    const stocks = (nseData?.data||[]).filter(s=>s.symbol!=='NIFTY 50');
+    nifty50Stocks = stocks.map(s=>({
+      symbol:s.symbol, price:s.lastPrice, chgPct:s.pChange,
+      chg:s.change, high:s.dayHigh, low:s.dayLow,
+      open:s.open, prev:s.previousClose,
+      mcap: s.totalMarketCap||s.ffmc||0
     }));
-    stocks.forEach(s => { if (s.pChange > 0) adv++; else if (s.pChange < 0) dec++; else unc++; });
-    topGainers = [...nifty50Stocks].sort((a,b) => b.chgPct - a.chgPct).slice(0, 5);
-    topLosers  = [...nifty50Stocks].sort((a,b) => a.chgPct - b.chgPct).slice(0, 5);
+    stocks.forEach(s=>{ if(s.pChange>0)adv++; else if(s.pChange<0)dec++; else unc++; });
+    topGainers = [...nifty50Stocks].sort((a,b)=>b.chgPct-a.chgPct).slice(0,5);
+    topLosers  = [...nifty50Stocks].sort((a,b)=>a.chgPct-b.chgPct).slice(0,5);
+    console.log('NSE stocks OK:', nifty50Stocks.length, 'stocks');
   } catch(e) { console.log('NSE stocks failed:', e.message); }
 
-  // Market Mood Index calculation
+  // ── MMI calculation ──────────────────────────────────────────────
   let mmi = 50;
-  if (nifty50?.price && nifty50.fiftyTwoWeekLow && nifty50.fiftyTwoWeekHigh) {
-    const range = nifty50.fiftyTwoWeekHigh - nifty50.fiftyTwoWeekLow;
-    if (range > 0) mmi = ((nifty50.price - nifty50.fiftyTwoWeekLow) / range) * 100;
+  const n50 = nifty50;
+  if (n50?.price && n50.fiftyTwoWeekLow && n50.fiftyTwoWeekHigh) {
+    const range = n50.fiftyTwoWeekHigh - n50.fiftyTwoWeekLow;
+    if (range > 0) mmi = ((n50.price - n50.fiftyTwoWeekLow) / range) * 100;
   }
-  const vixVal = indiaVIX?.price || 0;
-  if (vixVal > 0) { const vs = vixVal<12?85:vixVal<16?70:vixVal<20?50:vixVal<25?30:15; mmi = (mmi + vs) / 2; }
-  if (fiiNet !== null) { const fs = fiiNet>2000?80:fiiNet>0?62:fiiNet>-2000?40:20; mmi = (mmi * 2 + fs) / 3; }
-  if (adv + dec > 0) { const as = (adv / (adv + dec)) * 100; mmi = (mmi * 3 + as) / 4; }
-  mmi = Math.max(0, Math.min(100, Math.round(mmi)));
+  const vix = indiaVIX?.price || 0;
+  if (vix > 0) { const vs=vix<12?85:vix<16?70:vix<20?50:vix<25?30:15; mmi=(mmi+vs)/2; }
+  if (fiiNet!==null) { const fs=fiiNet>2000?80:fiiNet>0?62:fiiNet>-2000?40:20; mmi=(mmi*2+fs)/3; }
+  if (adv+dec>0) { const as=(adv/(adv+dec))*100; mmi=(mmi*3+as)/4; }
+  mmi = Math.max(0,Math.min(100,Math.round(mmi)));
   const mmiLabel = mmi>=70?'Extreme Greed':mmi>=55?'Greed':mmi>=45?'Neutral':mmi>=30?'Fear':'Extreme Fear';
   const mmiColor = mmi>=70?'#00c853':mmi>=55?'#76d275':mmi>=45?'#ffba00':mmi>=30?'#ff6f00':'#f44336';
 
   const data = {
     ts: Date.now(),
     // Indian indices
-    nifty50, bankNifty, midcap, smallcap, sensex,
-    // Sectoral
+    nifty50, bankNifty,
+    midcap: midcap||null,   // FIX: ensure null if not fetched
+    smallcap, sensex,
     niftyIT, niftyPharma, niftyFMCG, niftyAuto, niftyMetal, niftyRealty, niftyEnergy,
-    // VIX + GIFT
-    indiaVIX, giftNifty,
-    // Global
-    sp500, nasdaq, dow, ftse, hangseng, nikkei, dax,
+    indiaVIX,
+    // GIFT Nifty — use pre-open data from NSE if available
+    giftNifty: null, // Will be populated separately if NSE provides it
+    // Global (native currencies)
+    sp500: sp500 ? {...sp500, displayCurrency:'USD'} : null,
+    nasdaq: nasdaq ? {...nasdaq, displayCurrency:'USD'} : null,
+    dow: dow ? {...dow, displayCurrency:'USD'} : null,
+    ftse: ftse ? {...ftse, displayCurrency:'GBP'} : null,
+    hangseng: hangseng ? {...hangseng, displayCurrency:'HKD'} : null,
+    nikkei: nikkei ? {...nikkei, displayCurrency:'JPY'} : null,
+    dax: dax ? {...dax, displayCurrency:'EUR'} : null,
     // Commodities
     crude, gold, silver, naturalGas,
-    // Currency
-    usdinr, eurinr, jpyinr, gbpinr, usdInrRate,
+    // FX
+    usdinr, eurinr, jpyinr, gbpinr, aedinr, usdInrRate,
     // FII/DII
     fiiNet, fiiB, fiiS, diiNet, diiB, diiS, fiiHistory,
-    // Breadth + Heatmap
+    // Breadth
     adv, dec, unc, nifty50Stocks, topGainers, topLosers,
     // Mood
     mmi, mmiLabel, mmiColor,
-    // History
-    niftyCloses: niftyHistory?.closes || []
+    // History for sparkline
+    niftyCloses: niftyHist?.closes || [],
   };
 
+  // Try to get GIFT Nifty from NSE pre-open
+  try {
+    const preOpen = await nseGet('/api/market-data-pre-open?key=NIFTY');
+    const giftPrice = preOpen?.data?.find(d=>d.metadata?.symbol==='NIFTY')?.metadata?.lastPrice;
+    if (giftPrice) data.giftNifty = { price: giftPrice, changePct: 0, change: 0, symbol: 'GIFT NIFTY' };
+  } catch(e) {}
+
   mktCache = { data, fetchedAt: Date.now() };
+  console.log('Market data ready. NIFTY:', n50?.price, 'Midcap:', midcap?.price, 'FII:', fiiNet);
   res.json(data);
 });
 
-// ── Health check ─────────────────────────────────────────────────
+// ── Health ───────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'Surans Price Server v3.0',
-    endpoints: ['/gold', '/nse/:symbol', '/us/:symbol', '/batch', '/marketdata'],
-    marketDataCached: mktCache.data ? `Yes (${Math.round((Date.now()-mktCache.fetchedAt)/1000)}s ago)` : 'No',
-    goldCache: goldCache.ibja > 0 ? `₹${goldCache.ibja}/g` : 'Not fetched'
+    status: 'Surans Price Server v3.1',
+    endpoints: ['/gold','/nse/:symbol','/us/:symbol','/batch','/marketdata'],
+    cacheAge: mktCache.data ? Math.round((Date.now()-mktCache.fetchedAt)/1000)+'s' : 'empty',
+    goldCache: goldCache.ibja > 0 ? '₹'+goldCache.ibja+'/g' : 'none',
+    nseLastCookie: nseCache.cookie ? 'yes ('+Math.round((Date.now()-nseCache.fetchedAt)/60000)+'m ago)' : 'none',
   });
 });
 
-app.listen(PORT, () => console.log(`Price server v3.0 running on port ${PORT}`));
+app.listen(PORT, () => console.log('Price server v3.1 on port', PORT));
