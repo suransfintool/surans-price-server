@@ -61,13 +61,41 @@ async function getNSECookie() {
     return nseCache.cookie;
   }
   try {
-    const r = await axios.get('https://www.nseindia.com', {
-      headers: { 'User-Agent': YA_HDR['User-Agent'], 'Accept': 'text/html,application/xhtml+xml' },
-      timeout: 10000, maxRedirects: 5,
+    // Step 1: Hit homepage to get initial cookies
+    const r1 = await axios.get('https://www.nseindia.com', {
+      headers: {
+        'User-Agent': YA_HDR['User-Agent'],
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+      },
+      timeout: 12000,
+      maxRedirects: 5,
     });
-    const cookies = (r.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+    let cookies = (r1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+
+    // Step 2: Hit the FII/DII page to establish session
+    await new Promise(r => setTimeout(r, 800));
+    try {
+      const r2 = await axios.get('https://www.nseindia.com/market-data/fii-dii-activity', {
+        headers: {
+          'User-Agent': YA_HDR['User-Agent'],
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          'Referer': 'https://www.nseindia.com',
+          'Cookie': cookies,
+        },
+        timeout: 10000,
+        maxRedirects: 3,
+      });
+      const moreCookies = (r2.headers['set-cookie'] || []).map(c => c.split(';')[0]);
+      if (moreCookies.length) cookies = cookies + '; ' + moreCookies.join('; ');
+    } catch(e2) { /* ignore */ }
+
     nseCache.cookie = cookies;
     nseCache.fetchedAt = Date.now();
+    console.log('NSE cookie obtained, length:', cookies.length);
     return cookies;
   } catch(e) {
     console.log('NSE cookie failed:', e.message);
@@ -80,11 +108,19 @@ async function nseGet(path) {
   const r = await axios.get(`https://www.nseindia.com${path}`, {
     headers: {
       'User-Agent': YA_HDR['User-Agent'],
-      'Accept': 'application/json',
-      'Referer': 'https://www.nseindia.com/',
+      'Accept': 'application/json, text/plain, */*',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Accept-Encoding': 'gzip, deflate, br',
+      'Referer': 'https://www.nseindia.com/market-data/fii-dii-activity',
+      'Origin': 'https://www.nseindia.com',
+      'Connection': 'keep-alive',
+      'Sec-Fetch-Dest': 'empty',
+      'Sec-Fetch-Mode': 'cors',
+      'Sec-Fetch-Site': 'same-origin',
       'Cookie': cookie,
+      'X-Requested-With': 'XMLHttpRequest',
     },
-    timeout: 12000,
+    timeout: 15000,
   });
   return r.data;
 }
@@ -216,9 +252,11 @@ app.get('/marketdata', async (req, res) => {
   let fiiNet=null,fiiB=null,fiiS=null,diiNet=null,diiB=null,diiS=null,fiiHistory=[];
   let nifty50Stocks=[],adv=0,dec=0,unc=0,topGainers=[],topLosers=[];
 
+  // FII/DII — try multiple NSE endpoints with proper headers
   try {
+    // Try 1: fiidiiTradeReact
     const fiiData = await nseGet('/api/fiidiiTradeReact');
-    if (fiiData?.length) {
+    if (fiiData?.length && parseFloat(fiiData[0]?.NET_VALUE_FII||0) !== 0) {
       const t = fiiData[0];
       fiiNet = +parseFloat(t.NET_VALUE_FII||0).toFixed(2);
       fiiB   = +parseFloat(t.BUY_VALUE_FII||0).toFixed(2);
@@ -227,11 +265,52 @@ app.get('/marketdata', async (req, res) => {
       diiB   = +parseFloat(t.BUY_VALUE_DII||0).toFixed(2);
       diiS   = +parseFloat(t.SELL_VALUE_DII||0).toFixed(2);
       fiiHistory = fiiData.slice(0,7).map(r=>({
-        date: r.date||r.DATE||'', fii: +parseFloat(r.NET_VALUE_FII||0).toFixed(2), dii: +parseFloat(r.NET_VALUE_DII||0).toFixed(2)
+        date: r.date||r.DATE||r.tradeDate||'',
+        fii: +parseFloat(r.NET_VALUE_FII||0).toFixed(2),
+        dii: +parseFloat(r.NET_VALUE_DII||0).toFixed(2)
       }));
-      console.log('FII data OK, net:', fiiNet);
+      console.log('FII OK via fiidiiTradeReact, net:', fiiNet);
+    } else {
+      throw new Error('Zero or empty FII data');
     }
-  } catch(e) { console.log('FII failed:', e.message); }
+  } catch(e1) {
+    console.log('FII attempt 1 failed:', e1.message, '— trying alt endpoint');
+    try {
+      // Try 2: fiiDiiData endpoint (alternate NSE path)
+      const fiiData2 = await nseGet('/api/fiiDiiData');
+      if (fiiData2?.length && parseFloat(fiiData2[0]?.netPurchasesSalesCrore||0) !== 0) {
+        const t = fiiData2[0];
+        fiiNet = +parseFloat(t.netPurchasesSalesCrore||0).toFixed(2);
+        fiiB   = +parseFloat(t.totalPurchasesCrore||0).toFixed(2);
+        fiiS   = +parseFloat(t.totalSalesCrore||0).toFixed(2);
+        const d2 = fiiData2[1];
+        if (d2) {
+          diiNet = +parseFloat(d2.netPurchasesSalesCrore||0).toFixed(2);
+          diiB   = +parseFloat(d2.totalPurchasesCrore||0).toFixed(2);
+          diiS   = +parseFloat(d2.totalSalesCrore||0).toFixed(2);
+        }
+        console.log('FII OK via fiiDiiData, net:', fiiNet);
+      } else {
+        throw new Error('Zero or empty FII data alt');
+      }
+    } catch(e2) {
+      console.log('FII attempt 2 failed:', e2.message, '— using cached FII if available');
+      // Use cached FII data from previous successful fetch
+      if (mktCache.data?.fiiNet && mktCache.data.fiiNet !== 0) {
+        fiiNet = mktCache.data.fiiNet;
+        fiiB   = mktCache.data.fiiB;
+        fiiS   = mktCache.data.fiiS;
+        diiNet = mktCache.data.diiNet;
+        diiB   = mktCache.data.diiB;
+        diiS   = mktCache.data.diiS;
+        fiiHistory = mktCache.data.fiiHistory || [];
+        console.log('Using cached FII data:', fiiNet);
+      } else {
+        fiiNet = null; // explicitly null = not available
+        console.log('FII unavailable — will show "after 5PM" message');
+      }
+    }
+  }
 
   try {
     const nseData = await nseGet('/api/equity-stockIndices?index=NIFTY%2050');
@@ -310,7 +389,7 @@ app.get('/marketdata', async (req, res) => {
 // ── Health ───────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'Surans Price Server v3.1',
+    status: 'Surans Price Server v3.2',
     endpoints: ['/gold','/nse/:symbol','/us/:symbol','/batch','/marketdata'],
     cacheAge: mktCache.data ? Math.round((Date.now()-mktCache.fetchedAt)/1000)+'s' : 'empty',
     goldCache: goldCache.ibja > 0 ? '₹'+goldCache.ibja+'/g' : 'none',
