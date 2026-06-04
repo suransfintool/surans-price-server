@@ -160,19 +160,42 @@ app.get('/gold', async (req, res) => {
 // ── NSE single stock / SGB / index ───────────────────────────────
 app.get('/nse/:symbol', async (req, res) => {
   const sym = req.params.symbol.toUpperCase();
-  // SGB bonds: try multiple Yahoo formats
-  const sgbFormats = [`${sym}.NS`, sym, `${sym}24.BO`, `${sym}BE.BO`];
-  // Try Yahoo with .NS first (most Indian stocks)
-  for (const fmt of [`${sym}.NS`, sym]) {
+  const isSGB = sym.startsWith('SGB') || sym.includes('SGBDE') || sym.includes('SGBJUL') || sym.includes('SGBMAR') || sym.includes('SGBAUG');
+
+  if (isSGB) {
+    // For SGB bonds, NSE API is more reliable than Yahoo
+    try {
+      const data = await nseGet(`/api/quote-equity?symbol=${encodeURIComponent(sym)}`);
+      const price = data?.priceInfo?.lastPrice || data?.priceInfo?.close;
+      if (price > 0) {
+        console.log(`SGB ${sym} via NSE API: ₹${price}`);
+        return res.json({ symbol: sym, price, change: data?.priceInfo?.change||0, changePct: data?.priceInfo?.pChange||0, source: 'NSE' });
+      }
+    } catch(e) { console.log(`SGB NSE failed for ${sym}:`, e.message); }
+
+    // SGB fallback: compute from gold price
+    try {
+      if (goldCache.ibja > 0) {
+        const goldPrice = goldCache.ibja;
+        console.log(`SGB ${sym} using gold proxy: ₹${goldPrice}`);
+        return res.json({ symbol: sym, price: goldPrice, source: 'GoldProxy', note: 'Based on IBJA gold rate' });
+      }
+    } catch(e) {}
+  }
+
+  // Regular stocks: Yahoo first
+  for (const fmt of [`${sym}.NS`, sym, `${sym}.BO`]) {
     const d = await yf(fmt);
     if (d?.price > 0) return res.json({ symbol: sym, price: d.price, change: d.change, changePct: d.changePct, source: 'Yahoo' });
   }
-  // Try NSE API for SGB bonds specifically
+
+  // Fallback: NSE API
   try {
     const data = await nseGet(`/api/quote-equity?symbol=${encodeURIComponent(sym)}`);
-    const price = data?.priceInfo?.lastPrice || data?.lastPrice;
+    const price = data?.priceInfo?.lastPrice;
     if (price > 0) return res.json({ symbol: sym, price, source: 'NSE' });
   } catch(e) {}
+
   res.status(404).json({ symbol: sym, price: null, error: 'Not found' });
 });
 
@@ -389,7 +412,7 @@ app.get('/marketdata', async (req, res) => {
 // ── Health ───────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
-    status: 'Surans Price Server v3.2',
+    status: 'Surans Price Server v3.3',
     endpoints: ['/gold','/nse/:symbol','/us/:symbol','/batch','/marketdata'],
     cacheAge: mktCache.data ? Math.round((Date.now()-mktCache.fetchedAt)/1000)+'s' : 'empty',
     goldCache: goldCache.ibja > 0 ? '₹'+goldCache.ibja+'/g' : 'none',
