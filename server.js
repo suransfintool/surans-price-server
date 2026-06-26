@@ -97,7 +97,7 @@ async function getNSECookie() {
   }
 }
 
-async function nseAPI(path) {
+async function nseAPI(path, referer) {
   const cookie = await getNSECookie();
   const r = await axios.get(`https://www.nseindia.com${path}`, {
     headers: {
@@ -105,7 +105,7 @@ async function nseAPI(path) {
       'Accept': 'application/json, text/plain, */*',
       'Accept-Language': 'en-IN,en;q=0.9',
       'Accept-Encoding': 'gzip, deflate, br',
-      'Referer': 'https://www.nseindia.com/market-data/fii-dii-activity',
+      'Referer': referer || 'https://www.nseindia.com/',
       'Origin': 'https://www.nseindia.com',
       'Connection': 'keep-alive',
       'Sec-Fetch-Dest': 'empty',
@@ -195,23 +195,44 @@ app.get('/nse/:symbol', async (req, res) => {
   const isSGB = /SGB[A-Z0-9]/.test(sym);
 
   if (isSGB) {
-    // SGB: NSE secondary market via API
+    // Attempt 1: NSE equity quote API with the CORRECT referer (NSE checks this)
     try {
-      nseSession.cookie || await getNSECookie(); // ensure session
-      const data = await nseAPI(`/api/quote-equity?symbol=${encodeURIComponent(sym)}`);
-      const price = data?.priceInfo?.lastPrice || data?.priceInfo?.close || data?.lastPrice;
+      const data = await nseAPI(
+        `/api/quote-equity?symbol=${encodeURIComponent(sym)}`,
+        `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(sym)}`
+      );
+      const price = data?.priceInfo?.lastPrice || data?.priceInfo?.close;
       if (price > 0) {
-        console.log(`SGB ${sym} from NSE: ₹${price}`);
-        return res.json({ symbol: sym, price, change: data?.priceInfo?.change||0, changePct: data?.priceInfo?.pChange||0, source: 'NSE' });
+        console.log(`SGB ${sym} from NSE equity API: ₹${price}`);
+        return res.json({ symbol: sym, price, change: data?.priceInfo?.change || 0, changePct: data?.priceInfo?.pChange || 0, source: 'NSE', isLive: true });
       }
-    } catch(e) { console.log(`SGB NSE failed: ${e.message}`); }
+    } catch (e) { console.log(`SGB NSE equity API failed: ${e.message}`); }
 
-    // SGB fallback: gold rate (SGB tracks gold price)
-    const goldRate = goldCache.ibja > 0 ? goldCache.ibja : await fetchGoldRate();
-    if (goldRate) {
-      console.log(`SGB ${sym} using gold rate: ₹${goldRate}`);
-      return res.json({ symbol: sym, price: goldRate, source: 'GoldRate', note: 'SGB tracks gold — using IBJA rate' });
-    }
+    // Attempt 2: NSE bonds/securities-info API (SGBs are listed under the debt segment)
+    try {
+      const data2 = await nseAPI(
+        `/api/quote-equity?symbol=${encodeURIComponent(sym)}&section=trade_info`,
+        `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(sym)}`
+      );
+      const price2 = data2?.priceInfo?.lastPrice || data2?.lastPrice;
+      if (price2 > 0) {
+        console.log(`SGB ${sym} from NSE trade_info: ₹${price2}`);
+        return res.json({ symbol: sym, price: price2, source: 'NSE', isLive: true });
+      }
+    } catch (e) { console.log(`SGB NSE trade_info failed: ${e.message}`); }
+
+    // Both NSE attempts failed — DO NOT substitute gold spot rate as if it were
+    // the traded SGB price. SGBs trade at a premium/discount to spot gold, so
+    // gold rate ≠ SGB market price. Return clearly as unavailable instead of a
+    // plausible-looking but wrong number.
+    console.log(`SGB ${sym}: NSE unavailable, returning unavailable (not substituting gold rate)`);
+    return res.status(503).json({
+      symbol: sym,
+      price: null,
+      source: 'unavailable',
+      reason: 'NSE_BLOCKED',
+      message: 'Live NSE price unavailable right now. Showing your last saved price instead of an estimate.',
+    });
   }
 
   // Regular stocks: Yahoo .NS → .BO → bare
@@ -225,7 +246,10 @@ app.get('/nse/:symbol', async (req, res) => {
 
   // NSE API fallback
   try {
-    const data = await nseAPI(`/api/quote-equity?symbol=${encodeURIComponent(sym)}`);
+    const data = await nseAPI(
+      `/api/quote-equity?symbol=${encodeURIComponent(sym)}`,
+      `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(sym)}`
+    );
     const price = data?.priceInfo?.lastPrice;
     if (price > 0) return res.json({ symbol: sym, price, source: 'NSE' });
   } catch(e) {}
